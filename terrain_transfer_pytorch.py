@@ -82,13 +82,13 @@ def compute_content_loss(gen_features, content_features):
     return F.mse_loss(gen_features, content_features)
 
 def compute_style_loss(gen_features, style_features):
-    """Compute style loss as per paper Section 2.2, equation 3"""
+    """Compute style loss exactly as in transfer_morphology"""
     b, c, h, w = gen_features.size()
     gen_gram = gram_matrix(gen_features)
     style_gram = gram_matrix(style_features)
     
-    # Normalize as per paper's equation
-    return torch.sum((gen_gram - style_gram) ** 2) / (4 * (c ** 2))
+    # Normalize by all dimensions as in original paper
+    return torch.sum((gen_gram - style_gram) ** 2) / (4 * (c * h * w) ** 2)
 
 def total_variation_loss(image):
     """Calculate total variation loss as per paper Section 3, equation 5"""
