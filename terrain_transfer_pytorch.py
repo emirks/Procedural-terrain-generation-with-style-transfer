@@ -80,31 +80,34 @@ def load_image(image_path, size=256):
 def gram_matrix(x):
     """
     x: tensor of shape (batch, channels, height, width)
+    Should compute correlations between feature maps
     """
-    print("x")
-    print(x.shape)
-    if x.dim() == 4:  # (batch, channels, height, width)
-        x = x.squeeze(0)  # Remove batch dimension if present
-    x = x.permute(2, 0, 1)  # Move width to first dimension
-    print("permuted x")
-    print(x.shape)
-    features = x.reshape(x.shape[0], -1)  # Reshape to (channels, height*width)
-    print("features")
-    print(features.shape)
-    gram = torch.mm(features, features.t())  # Matrix multiplication
-    print("gram")
-    print(gram.shape)
+    b, c, h, w = x.size()  # b=1, c=channels, h=height, w=width
+    
+    # Reshape to (channels, height*width)
+    features = x.view(b * c, h * w)
+    
+    # Compute gram matrix
+    gram = torch.mm(features, features.t())
+    
+    print(f"Input shape: {x.shape}")
+    print(f"Features shape: {features.shape}")
+    print(f"Gram matrix shape: {gram.shape}")
+    
     return gram
 
 def style_loss(style, combination):
     """
-    Exact implementation of the paper's style loss
+    Compute style loss between two feature maps
     """
     S = gram_matrix(style)
     C = gram_matrix(combination)
-    channels = 3
-    size = style.shape[2] * style.shape[3]  # height * width
-    return torch.sum((S - C) ** 2) / (4.0 * (channels ** 2) * (size ** 2))
+    
+    # Get dimensions for normalization
+    _, c, h, w = style.shape
+    
+    # Normalize by number of elements in each feature map
+    return torch.sum((S - C) ** 2) / (4.0 * (c ** 2) * (h * w) ** 2)
 
 def content_loss(base, combination):
     """
@@ -246,6 +249,12 @@ def main(args):
                     best_img = gen_img.clone()
                 
                 # Update progress bar with normalized values
+                gen_features = model(gen_img)
+                content_feat = content_features[model.content_layer]
+                gen_content_feat = gen_features[model.content_layer]
+                style_feat = style_features[list(model.style_layers)[0]]  # Using first style layer
+                gen_style_feat = gen_features[list(model.style_layers)[0]]
+
                 pbar.set_postfix({
                     'total_loss': f'{total_loss.item():.2f}',
                     'content': f'{(content_weight * content_loss(content_feat, gen_content_feat)).item():.2f}',
