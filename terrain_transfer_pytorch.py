@@ -77,41 +77,80 @@ def load_image(image_path, size=256):
     image = image - mean  # Subtract mean
     return image
 
-def gram_matrix(tensor):
+def gram_matrix(x):
     """
-    Calculate Gram Matrix with proper scaling
+    x: tensor of shape (batch, channels, height, width)
     """
-    b, c, h, w = tensor.size()
-    features = tensor.view(b, c, h * w)
-    features_t = features.transpose(1, 2)
-    gram = torch.bmm(features, features_t)
-    return gram.div(c * h * w)
+    print("x")
+    print(x.shape)
+    if x.dim() == 4:  # (batch, channels, height, width)
+        x = x.squeeze(0)  # Remove batch dimension if present
+    x = x.permute(2, 0, 1)  # Move width to first dimension
+    print("permuted x")
+    print(x.shape)
+    features = x.reshape(x.shape[0], -1)  # Reshape to (channels, height*width)
+    print("features")
+    print(features.shape)
+    gram = torch.mm(features, features.t())  # Matrix multiplication
+    print("gram")
+    print(gram.shape)
+    return gram
 
-def compute_content_loss(gen_features, content_features):
+def style_loss(style, combination):
     """
-    Compute content loss as per paper Section 2.2, equation 1
+    Exact implementation of the paper's style loss
     """
-    return torch.mean((gen_features - content_features) ** 2)
+    S = gram_matrix(style)
+    C = gram_matrix(combination)
+    channels = 3
+    size = style.shape[2] * style.shape[3]  # height * width
+    return torch.sum((S - C) ** 2) / (4.0 * (channels ** 2) * (size ** 2))
 
-def compute_style_loss(gen_features, style_features):
+def content_loss(base, combination):
     """
-    Compute style loss with proper scaling
+    Exact implementation of the paper's content loss
     """
-    gen_gram = gram_matrix(gen_features)
-    style_gram = gram_matrix(style_features)
-    
-    # Normalize by feature dimensions
-    b, c, h, w = gen_features.size()
-    return torch.mean((gen_gram - style_gram) ** 2)
+    return torch.sum((combination - base) ** 2)
 
-def total_variation_loss(image):
+def total_variation_loss(x):
     """
-    Calculate total variation loss with proper normalization
+    Exact implementation of the paper's total variation loss
     """
-    b, c, h, w = image.size()
-    diff_i = torch.sum(torch.abs(image[:, :, :, 1:] - image[:, :, :, :-1]))
-    diff_j = torch.sum(torch.abs(image[:, :, 1:, :] - image[:, :, :-1, :]))
-    return (diff_i + diff_j) / (b * c * h * w)
+    a = (x[:, :, :-1, :-1] - x[:, :, 1:, :-1]) ** 2
+    b = (x[:, :, :-1, :-1] - x[:, :, :-1, 1:]) ** 2
+    return torch.sum((a + b) ** 1.25)
+
+def compute_loss(model, gen_img, content_img, style_img, content_layer, style_layers, 
+                content_weight, style_weight, tv_weight):
+    """
+    Exact implementation of the paper's loss computation
+    """
+    # Get features for all images
+    content_features = model(content_img)
+    style_features = model(style_img)
+    gen_features = model(gen_img)
+
+    # Initialize loss
+    loss = torch.tensor(0.0).to(gen_img.device)
+
+    # Add content loss
+    content_feat = content_features[content_layer]
+    gen_content_feat = gen_features[content_layer]
+    loss = loss + content_weight * content_loss(content_feat, gen_content_feat)
+
+    # Add style loss
+    style_loss_total = 0
+    for layer in style_layers:
+        style_feat = style_features[layer]
+        gen_style_feat = gen_features[layer]
+        sl = style_loss(style_feat, gen_style_feat)
+        style_loss_total += sl
+    loss += (style_weight / len(style_layers)) * style_loss_total
+
+    # Add total variation loss
+    loss += tv_weight * total_variation_loss(gen_img)
+
+    return loss
 
 def save_image(tensor, filename):
     image = tensor.clone().detach()
@@ -186,45 +225,17 @@ def main(args):
             for i in pbar:
                 optimizer.zero_grad()
                 
-                # Get features of generated image
-                gen_features = model(gen_img)
-                
-                # Compute losses
-                content_loss = compute_content_loss(
-                    gen_features[model.content_layer],
-                    content_features[model.content_layer]
+                total_loss = compute_loss(
+                    model=model,
+                    gen_img=gen_img,
+                    content_img=content_img,
+                    style_img=style_img,
+                    content_layer=model.content_layer,
+                    style_layers=model.style_layers,
+                    content_weight=content_weight,
+                    style_weight=style_weight,
+                    tv_weight=tv_weight
                 )
-                
-                # Compute style loss for each layer
-                style_loss = 0
-                for layer in model.style_layers:
-                    layer_style_loss = compute_style_loss(
-                        gen_features[layer],
-                        style_features[layer]
-                    )
-                    style_loss += layer_style_loss
-                    if i % 100 == 0:
-                        print(f"Style loss for layer {layer}: {layer_style_loss.item():.4f}")
-                
-                style_loss /= len(model.style_layers)
-                tv_loss = total_variation_loss(gen_img)
-                
-                # Total loss
-                total_loss = (content_weight * content_loss + 
-                            style_weight * style_loss + 
-                            tv_weight * tv_loss)
-                
-                # Log detailed loss components
-                if i % 100 == 0:
-                    print(f"\nIteration {i}")
-                    print(f"Content loss: {content_loss.item():.4f}")
-                    print(f"Style loss: {style_loss.item():.4f}")
-                    print(f"TV loss: {tv_loss.item():.4f}")
-                    print(f"Total loss: {total_loss.item():.4f}")
-                    print(f"Current learning rate: {optimizer.param_groups[0]['lr']:.6f}")
-                    
-                    # Log image statistics
-                    print(f"Generated image min/max: {gen_img.min().item():.2f}/{gen_img.max().item():.2f}")
                 
                 total_loss.backward()
                 optimizer.step()
@@ -237,9 +248,9 @@ def main(args):
                 # Update progress bar with normalized values
                 pbar.set_postfix({
                     'total_loss': f'{total_loss.item():.2f}',
-                    'content': f'{(content_weight * content_loss).item():.2f}',
-                    'style': f'{(style_weight * style_loss).item():.2f}',
-                    'tv': f'{(tv_weight * tv_loss).item():.2f}'
+                    'content': f'{(content_weight * content_loss(content_feat, gen_content_feat)).item():.2f}',
+                    'style': f'{(style_weight * style_loss(style_feat, gen_style_feat)).item():.2f}',
+                    'tv': f'{(tv_weight * total_variation_loss(gen_img)).item():.2f}'
                 })
                 
                 # Save intermediate result
