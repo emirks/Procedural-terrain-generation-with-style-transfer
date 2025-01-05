@@ -48,10 +48,6 @@ class VGG19Features(nn.Module):
                 features[name] = x
         return features
 
-def get_image_size(image_path, target_height=512):
-    width, height = Image.open(image_path).size
-    new_width = int(width * target_height / height)
-    return target_height, new_width
 
 def load_image(image_path, size=256):
     image = Image.open(image_path)
@@ -77,83 +73,83 @@ def load_image(image_path, size=256):
     image = image - mean  # Subtract mean
     return image
 
-def gram_matrix(x):
+def gram_matrix(tensor):
     """
-    x: tensor of shape (batch, channels, height, width)
-    Should compute correlations between feature maps
+    Calculate Gram Matrix with proper scaling
     """
-    b, c, h, w = x.size()  # b=1, c=channels, h=height, w=width
+    b, c, h, w = tensor.size()
+    features = tensor.view(b, c, h * w)
+    features_t = features.transpose(1, 2)
+    gram = torch.bmm(features, features_t)
+    return gram.div(c * h * w)
+
+def compute_content_loss(gen_features, content_features):
+    """
+    Compute content loss as per paper Section 2.2, equation 1
+    """
+    return torch.mean((gen_features - content_features) ** 2)
+
+def channel_statistics_loss(gen_features, style_features):
+    """Compute style loss using channel-wise mean and standard deviation"""
+    # Calculate channel-wise statistics
+    gen_mean = gen_features.mean(dim=[2, 3])
+    gen_std = gen_features.std(dim=[2, 3])
+    style_mean = style_features.mean(dim=[2, 3])
+    style_std = style_features.std(dim=[2, 3])
     
-    # Reshape to (channels, height*width)
-    features = x.view(b * c, h * w)
+    # Compute loss as MSE between statistics
+    mean_loss = torch.mean((gen_mean - style_mean) ** 2)
+    std_loss = torch.mean((gen_std - style_std) ** 2)
     
-    # Compute gram matrix
-    gram = torch.mm(features, features.t())
+    return mean_loss + std_loss
+
+def histogram_loss(gen_features, style_features, bins=256):
+    """Compute style loss using histogram matching of feature activations"""
+    b, c, h, w = gen_features.size()
+    gen_features_flat = gen_features.view(b * c, -1)
+    style_features_flat = style_features.view(b * c, -1)
     
-    print(f"Input shape: {x.shape}")
-    print(f"Features shape: {features.shape}")
-    print(f"Gram matrix shape: {gram.shape}")
+    loss = 0
+    for gen_feat, style_feat in zip(gen_features_flat, style_features_flat):
+        # Compute histograms
+        gen_hist = torch.histogram(gen_feat, bins=bins)[0]
+        style_hist = torch.histogram(style_feat, bins=bins)[0]
+        
+        # Normalize histograms
+        gen_hist = gen_hist / gen_hist.sum()
+        style_hist = style_hist / style_hist.sum()
+        
+        # Compute loss as Earth Mover's Distance (Wasserstein-1)
+        loss += torch.abs(torch.cumsum(gen_hist, dim=0) - torch.cumsum(style_hist, dim=0)).mean()
     
-    return gram
+    return loss / (b * c)
 
-def style_loss(style, combination):
+# Rename existing compute_style_loss to compute_style_loss_gram
+def compute_style_loss_gram(gen_features, style_features):
+    """Original Gram matrix style loss"""
+    gen_gram = gram_matrix(gen_features)
+    style_gram = gram_matrix(style_features)
+    return torch.mean((gen_gram - style_gram) ** 2)
+
+def compute_style_loss(gen_features, style_features, method='gram'):
+    """Unified style loss computation with multiple methods"""
+    if method == 'gram':
+        return compute_style_loss_gram(gen_features, style_features)
+    elif method == 'channel_stats':
+        return channel_statistics_loss(gen_features, style_features)
+    elif method == 'histogram':
+        return histogram_loss(gen_features, style_features)
+    else:
+        raise ValueError(f"Unknown style loss method: {method}")
+
+def total_variation_loss(image):
     """
-    Compute style loss between two feature maps
+    Calculate total variation loss with proper normalization
     """
-    S = gram_matrix(style)
-    C = gram_matrix(combination)
-    
-    # Get dimensions for normalization
-    _, c, h, w = style.shape
-    
-    # Normalize by number of elements in each feature map
-    return torch.sum((S - C) ** 2) / (4.0 * (c ** 2) * (h * w) ** 2)
-
-def content_loss(base, combination):
-    """
-    Exact implementation of the paper's content loss
-    """
-    return torch.sum((combination - base) ** 2)
-
-def total_variation_loss(x):
-    """
-    Exact implementation of the paper's total variation loss
-    """
-    a = (x[:, :, :-1, :-1] - x[:, :, 1:, :-1]) ** 2
-    b = (x[:, :, :-1, :-1] - x[:, :, :-1, 1:]) ** 2
-    return torch.sum((a + b) ** 1.25)
-
-def compute_loss(model, gen_img, content_img, style_img, content_layer, style_layers, 
-                content_weight, style_weight, tv_weight):
-    """
-    Exact implementation of the paper's loss computation
-    """
-    # Get features for all images
-    content_features = model(content_img)
-    style_features = model(style_img)
-    gen_features = model(gen_img)
-
-    # Initialize loss
-    loss = torch.tensor(0.0).to(gen_img.device)
-
-    # Add content loss
-    content_feat = content_features[content_layer]
-    gen_content_feat = gen_features[content_layer]
-    loss = loss + content_weight * content_loss(content_feat, gen_content_feat)
-
-    # Add style loss
-    style_loss_total = 0
-    for layer in style_layers:
-        style_feat = style_features[layer]
-        gen_style_feat = gen_features[layer]
-        sl = style_loss(style_feat, gen_style_feat)
-        style_loss_total += sl
-    loss += (style_weight / len(style_layers)) * style_loss_total
-
-    # Add total variation loss
-    loss += tv_weight * total_variation_loss(gen_img)
-
-    return loss
+    b, c, h, w = image.size()
+    diff_i = torch.sum(torch.abs(image[:, :, :, 1:] - image[:, :, :, :-1]))
+    diff_j = torch.sum(torch.abs(image[:, :, 1:, :] - image[:, :, :-1, :]))
+    return (diff_i + diff_j) / (b * c * h * w)
 
 def save_image(tensor, filename):
     image = tensor.clone().detach()
@@ -223,22 +219,54 @@ def main(args):
         best_loss = float('inf')
         best_img = None
         
+        # Modify output prefix to include style loss type
+        output_prefix = f"{args.output_prefix}_{args.style_loss_type}"
+        
         # Training loop
         with tqdm(range(args.iterations)) as pbar:
             for i in pbar:
                 optimizer.zero_grad()
                 
-                total_loss = compute_loss(
-                    model=model,
-                    gen_img=gen_img,
-                    content_img=content_img,
-                    style_img=style_img,
-                    content_layer=model.content_layer,
-                    style_layers=model.style_layers,
-                    content_weight=content_weight,
-                    style_weight=style_weight,
-                    tv_weight=tv_weight
+                # Get features of generated image
+                gen_features = model(gen_img)
+                
+                # Compute losses
+                content_loss = compute_content_loss(
+                    gen_features[model.content_layer],
+                    content_features[model.content_layer]
                 )
+                
+                # Compute style loss for each layer with selected method
+                style_loss = 0
+                for layer in model.style_layers:
+                    layer_style_loss = compute_style_loss(
+                        gen_features[layer],
+                        style_features[layer],
+                        method=args.style_loss_type
+                    )
+                    style_loss += layer_style_loss
+                    if i % 100 == 0:
+                        print(f"Style loss ({args.style_loss_type}) for layer {layer}: {layer_style_loss.item():.4f}")
+                
+                style_loss /= len(model.style_layers)
+                tv_loss = total_variation_loss(gen_img)
+                
+                # Total loss
+                total_loss = (content_weight * content_loss + 
+                            style_weight * style_loss + 
+                            tv_weight * tv_loss)
+                
+                # Log detailed loss components
+                if i % 100 == 0:
+                    print(f"\nIteration {i}")
+                    print(f"Content loss: {content_loss.item():.4f}")
+                    print(f"Style loss: {style_loss.item():.4f}")
+                    print(f"TV loss: {tv_loss.item():.4f}")
+                    print(f"Total loss: {total_loss.item():.4f}")
+                    print(f"Current learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+                    
+                    # Log image statistics
+                    print(f"Generated image min/max: {gen_img.min().item():.2f}/{gen_img.max().item():.2f}")
                 
                 total_loss.backward()
                 optimizer.step()
@@ -249,29 +277,23 @@ def main(args):
                     best_img = gen_img.clone()
                 
                 # Update progress bar with normalized values
-                gen_features = model(gen_img)
-                content_feat = content_features[model.content_layer]
-                gen_content_feat = gen_features[model.content_layer]
-                style_feat = style_features[list(model.style_layers)[0]]  # Using first style layer
-                gen_style_feat = gen_features[list(model.style_layers)[0]]
-
                 pbar.set_postfix({
                     'total_loss': f'{total_loss.item():.2f}',
-                    'content': f'{(content_weight * content_loss(content_feat, gen_content_feat)).item():.2f}',
-                    'style': f'{(style_weight * style_loss(style_feat, gen_style_feat)).item():.2f}',
-                    'tv': f'{(tv_weight * total_variation_loss(gen_img)).item():.2f}'
+                    'content': f'{(content_weight * content_loss).item():.2f}',
+                    'style': f'{(style_weight * style_loss).item():.2f}',
+                    'tv': f'{(tv_weight * tv_loss).item():.2f}'
                 })
                 
                 # Save intermediate result
-                if (i + 1) % 50 == 0:
-                    save_image(gen_img, f"{args.output_prefix}_iter_{i+1}.png")
+                if (i + 1) % 200 == 0:
+                    save_image(gen_img, f"{output_prefix}_iter_{i+1}.png")
                 
                 if (i + 1) % 100 == 0:
                     scheduler.step()
         
         # Save the best result at the end
         if best_img is not None:
-            save_image(best_img, f"{args.output_prefix}_best.png")
+            save_image(best_img, f"{output_prefix}_best.png")
                     
     except Exception as e:
         print(f"Error occurred: {str(e)}")
@@ -289,6 +311,9 @@ if __name__ == "__main__":
                       help="Number of iterations")
     parser.add_argument("--lr", type=float, default=0.1,
                       help="Learning rate")
+    parser.add_argument("--style_loss_type", type=str, default='gram',
+                      choices=['gram', 'channel_stats', 'histogram'],
+                      help="Style loss computation method")
     
     args = parser.parse_args()
     main(args)
